@@ -10,8 +10,6 @@ concurrency:
 
 env:
   # RW-Dateien liegen auf :00 (z. B. ...-2609302150-...) und erscheinen ca. 25 min danach
-  RW_STAMP_MINUTE: "00"
-  RW_DELAY_MINUTES: "25"
   RW_HOURS: "24"
   RW_BASE_URL: "https://opendata.dwd.de/weather/radar/radolan/rw"
   RW_DIR: "data/radarsumme"
@@ -48,13 +46,9 @@ jobs:
           mkdir -p "$RW_DIR"
           rm -f "$RW_DIR"/raa01-rw_10000-*-dwd---bin.hdf5   # nur die 24 aktuellen Dateien behalten
 
-          # Neueste Datei: letzter Zeitstempel HH:<RW_STAMP_MINUTE> UTC, der mindestens
-          # RW_DELAY_MINUTES zurueckliegt.  Bsp. 12:23 UTC -> 11:50, 12:10 UTC -> 10:50
-          NOW=$(date -u +%s)
-          REF=$(( NOW - RW_DELAY_MINUTES * 60 ))
-          LATEST=$(( (REF / 3600) * 3600 + RW_STAMP_MINUTE * 60 ))
-          if [ "$LATEST" -gt "$REF" ]; then LATEST=$(( LATEST - 3600 )); fi
-          echo "Neueste erwartete Datei: $(date -u -d @"$LATEST" '+%Y-%m-%d %H:%M') UTC"
+          # Neueste Datei: immer die aktuelle volle Stunde UTC, z. B. 12:16 -> 12:00
+          LATEST=$(( ($(date -u +%s) / 3600) * 3600 ))
+          echo "Neueste Datei: $(date -u -d @"$LATEST" '+%Y-%m-%d %H:%M') UTC"
 
           fetch() {   # $1 = Dateiname; 0 = ok, 1 = nicht verfuegbar
             local name="$1" tmp="${RUNNER_TEMP}/$1" code
