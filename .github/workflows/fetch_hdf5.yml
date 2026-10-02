@@ -1,0 +1,130 @@
+name: Fetch Radarsumme 24h and Generate Webp
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  # verhindert, dass zwei Laeufe gleichzeitig dieselbe Datei generieren/hochladen
+  group: fetch-radarsumme
+  cancel-in-progress: false
+
+env:
+  # RW-Dateien liegen auf :00 (z. B. ...-2609302150-...) und erscheinen ca. 25 min danach
+  RW_STAMP_MINUTE: "00"
+  RW_DELAY_MINUTES: "25"
+  RW_HOURS: "24"
+  RW_BASE_URL: "https://opendata.dwd.de/weather/radar/radolan/rw"
+  RW_DIR: "data/radarsumme"
+
+jobs:
+  fetch_generate_deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.LIVE_PAT }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Cache Python packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download 24 RW-Stundendateien (DWD Open Data, mit Retry)
+        run: |
+          mkdir -p "$RW_DIR"
+          rm -f "$RW_DIR"/raa01-rw_10000-*-dwd---bin.hdf5   # nur die 24 aktuellen Dateien behalten
+
+          # Neueste Datei: letzter Zeitstempel HH:<RW_STAMP_MINUTE> UTC, der mindestens
+          # RW_DELAY_MINUTES zurueckliegt.  Bsp. 12:23 UTC -> 11:50, 12:10 UTC -> 10:50
+          NOW=$(date -u +%s)
+          REF=$(( NOW - RW_DELAY_MINUTES * 60 ))
+          LATEST=$(( (REF / 3600) * 3600 + RW_STAMP_MINUTE * 60 ))
+          if [ "$LATEST" -gt "$REF" ]; then LATEST=$(( LATEST - 3600 )); fi
+          echo "Neueste erwartete Datei: $(date -u -d @"$LATEST" '+%Y-%m-%d %H:%M') UTC"
+
+          fetch() {   # $1 = Dateiname; 0 = ok, 1 = nicht verfuegbar
+            local name="$1" tmp="${RUNNER_TEMP}/$1" code
+            code=$(curl -s -o "$tmp" -w "%{http_code}" \
+              --connect-timeout 10 --max-time 120 \
+              "${RW_BASE_URL}/${name}" || echo "000")
+            if [ "$code" = "200" ] && [ -s "$tmp" ]; then
+              mv "$tmp" "${RW_DIR}/${name}"
+              return 0
+            fi
+            rm -f "$tmp"
+            LAST_CODE="$code"
+            return 1
+          }
+
+          name_for() { echo "raa01-rw_10000-$(date -u -d @"$1" +%y%m%d%H%M)-dwd---bin.hdf5"; }
+
+          # 1) Neueste Datei: Pflicht, mit Wiederholung (kann noch nicht hochgeladen sein)
+          LATEST_NAME=$(name_for "$LATEST")
+          MAX_ATTEMPTS=50
+          SLEEP_SECONDS=5
+          ok=0
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+            if fetch "$LATEST_NAME"; then
+              echo "Neueste Datei geladen (Versuch $i/$MAX_ATTEMPTS): $LATEST_NAME"
+              ok=1
+              break
+            fi
+            echo "Versuch $i/$MAX_ATTEMPTS: $LATEST_NAME noch nicht verfuegbar (HTTP $LAST_CODE)."
+            sleep "$SLEEP_SECONDS"
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::${LATEST_NAME} nach $MAX_ATTEMPTS Versuchen nicht verfuegbar - Abbruch."
+            exit 1
+          fi
+
+          # 2) Die 23 Stunden davor: 2 Versuche, fehlende werden nur gemeldet
+          missing=""
+          for k in $(seq 1 $(( RW_HOURS - 1 ))); do
+            name=$(name_for $(( LATEST - k * 3600 )))
+            if fetch "$name" || { sleep 3; fetch "$name"; }; then
+              :
+            else
+              echo "::warning::${name} nicht verfuegbar (HTTP $LAST_CODE)."
+              missing="$missing $name"
+            fi
+          done
+
+          count=$(ls "$RW_DIR"/raa01-rw_10000-*-dwd---bin.hdf5 | wc -l)
+          echo "Geladen: $count von $RW_HOURS Dateien."
+          [ -z "$missing" ] || echo "Fehlend:$missing"
+
+      - name: Generate radarsumme_latest.webp
+        run: python scripts/generate_webp.py
+
+      - name: Upload radarsumme_latest.webp to R2 (mit Retry)
+        run: |
+          MAX_ATTEMPTS=3
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+            if aws s3 cp ./output/radarsumme24h/radarsumme_latest.webp \
+                s3://${{ secrets.R2_BUCKET }}/radarsumme/radarsumme_latest.webp \
+                --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com; then
+              echo "Upload erfolgreich (Versuch $i/$MAX_ATTEMPTS)."
+              exit 0
+            fi
+            echo "Upload fehlgeschlagen (Versuch $i/$MAX_ATTEMPTS), warte 10s..."
+            sleep 10
+          done
+          echo "::error::Upload nach $MAX_ATTEMPTS Versuchen fehlgeschlagen."
+          exit 1
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
