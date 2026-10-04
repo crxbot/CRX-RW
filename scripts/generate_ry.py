@@ -28,7 +28,7 @@ from pyproj import Transformer
 SRC_DIR = Path("data/radarsumme")
 OUT_DIR = Path("output/radarsumme5min")
 OUT_FILENAME = "radarsumme5min_latest.webp"
-DRAW_IMAGE = True
+DRAW_IMAGE = False
 
 # raa01-ry_10000-YYMMDDHHMM-dwd---bin.hdf5
 FILENAME_RE = re.compile(r"raa01-ry_10000-(\d{10})-dwd---bin\.hdf5$")
