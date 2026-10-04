@@ -2,7 +2,7 @@ name: Cleanup Old Workflow Runs
 
 on:
   workflow_run:
-    workflows: ["Fetch Radarsumme 24h and Generate Webp"] # oder "*" für alle Workflows
+    workflows: ["Fetch Radarsumme 24h and Generate Webp", "Fetch Radar 5min (RY) and Generate Webp"]
     types:
       - completed  # Löst aus, sobald ein Run fertig ist
 permissions: 
