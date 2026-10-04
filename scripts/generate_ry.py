@@ -59,7 +59,7 @@ MAX_VALID_MM = 100.0      # je 5 min; int16 @ 0,01 mm reicht bis 327 mm
 MIN_VISIBLE_MM = LEVELS[0]
 
 # Chunk
-RS_FOURCC = b"RS5"
+RS_FOURCC = b"RS05"
 QUANTUM = 0.001            # mm pro int16-Einheit
 STORE_MIN_UNITS = 1      # >= 0,01 mm wird gespeichert
 
