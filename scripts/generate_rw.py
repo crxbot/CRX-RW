@@ -28,7 +28,7 @@ from pyproj import Transformer
 # --------------------------------------------------------------------------- #
 SRC_DIR = Path("data/radarsumme")
 OUT_DIR = Path("output/radarsumme24h")
-OUT_FILENAME = "radarsumme24_latest.webp"   # wird bei jedem Lauf überschrieben
+OUT_FILENAME = "radarsumme24h_latest.webp"   # wird bei jedem Lauf überschrieben
 DRAW_IMAGE = False   # False: leeres transparentes Bild, nur der RS24-Chunk enthält Daten
 
 # raa01-rw_10000-YYMMDDHHMM-dwd---bin.hdf5  (Zeit = Ende des 1h-Fensters, UTC)
