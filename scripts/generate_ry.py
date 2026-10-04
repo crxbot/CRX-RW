@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
-"""24h-Niederschlagssumme aus 24 RW-Stundendateien (RADOLAN RW).
+"""5-min-Niederschlag aus einer RY-Datei (RADOLAN RY), Einheit mm je 5 min.
 
-Ausgabe: eine WebP-Datei (radarsumme_latest.webp)
-  - Bild: leer/transparent (DRAW_IMAGE=False) oder farbige 24h-Summe (EPSG:3857)
-  - Chunk 'RS24': sparse Zeitreihe, nur Pixel mit >= 0,1 mm in mindestens einer Stunde,
-                  je Pixel alle 24 Stundenwerte (0,1-mm-Einheiten, int16)
+Ausgabe: eine WebP-Datei (ry_latest.webp)
+  - Bild: leer/transparent (DRAW_IMAGE=False) oder farbig (EPSG:3857)
+  - Chunk 'RY05': sparse, nur Pixel mit >= 0,01 mm, ein Zeitschritt (int16, 0,01-mm-Einheiten)
 
 Aufruf:
-  python radarsumme24h.py                 # neueste RW-Datei als Ende des Fensters
-  python radarsumme24h.py <rw-datei>      # bestimmte Datei als Ende
-  python radarsumme24h.py --query LAT LON <webp>   # Zeitreihe abfragen
+  python ry5min.py                        # neueste RY-Datei in SRC_DIR
+  python ry5min.py <ry-datei>             # bestimmte Datei
+  python ry5min.py --query LAT LON <webp> # Wert abfragen
 """
 import re
 import struct
 import sys
 import zlib
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import h5py
@@ -27,35 +26,42 @@ from pyproj import Transformer
 # Konfiguration
 # --------------------------------------------------------------------------- #
 SRC_DIR = Path("data/radarsumme")
-OUT_DIR = Path("output/radarsumme24h")
-OUT_FILENAME = "radarsumme_latest.webp"   # wird bei jedem Lauf überschrieben
-DRAW_IMAGE = False   # False: leeres transparentes Bild, nur der RS24-Chunk enthält Daten
+OUT_DIR = Path("output/radarsumme5min")
+OUT_FILENAME = "radarsumme5min_latest.webp"
+DRAW_IMAGE = True
 
-# raa01-rw_10000-YYMMDDHHMM-dwd---bin.hdf5  (Zeit = Ende des 1h-Fensters, UTC)
-FILENAME_RE = re.compile(r"raa01-rw_10000-(\d{10})-dwd---bin\.hdf5$")
-HOURS = 24
+# raa01-ry_10000-YYMMDDHHMM-dwd---bin.hdf5
+FILENAME_RE = re.compile(r"raa01-ry_10000-(\d{10})-dwd---bin\.hdf5$")
 
-DEFAULT_GAIN = 0.1
+DEFAULT_GAIN = 0.01
 DEFAULT_NODATA = 65535
 
+# Falls die Datei mm/h enthält: 5/60 setzen. Bei mm je 5 min: 1.0
+RATE_TO_MM = None
+
 COLORS = [
-    "#00C9FF", "#0057FF", "#0000EE", "#BEFFBD", "#98FE98", "#69FF68",
+    "#00C9FF", "#002AFF", "#0000EE", "#BEFFBD", "#98FE98", "#69FF68",
     "#30FF30", "#0AFF0A", "#00DC00", "#00BF00", "#008D00", "#FFFF00",
     "#F1D801", "#EABA00", "#F99C00", "#FE4100", "#FF2700", "#DC0000",
     "#B00000", "#FAC3FC", "#EBAAEA", "#DD95DE", "#C674C6", "#BA62B9",
     "#A342A3", "#861686", "#5C0F5C", "#410A41", "#320732",
 ]
-LEVELS = [0.1, 0.5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30,
-          35, 40, 45, 50, 60, 70, 80, 90, 100, 110, 130, 150, 250, 350]
+
+# Klassengrenzen in mm je 5 min (29 Farben = 30 Grenzen)
+LEVELS = [
+    0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8,
+    0.9, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5,
+    6, 7, 8, 9, 10, 11, 13, 15, 25, 35,
+]
 assert len(LEVELS) == len(COLORS) + 1
 
-MAX_VALID_MM = 1000.0
+MAX_VALID_MM = 100.0      # je 5 min; int16 @ 0,01 mm reicht bis 327 mm
 MIN_VISIBLE_MM = LEVELS[0]
 
 # Chunk
-RS_FOURCC = b"RS24"
-QUANTUM = 0.1            # mm pro int16-Einheit
-STORE_MIN_UNITS = 1      # >= 0,1 mm wird gespeichert
+RS_FOURCC = b"RS5"
+QUANTUM = 0.001            # mm pro int16-Einheit
+STORE_MIN_UNITS = 1      # >= 0,01 mm wird gespeichert
 
 MASK_OUTSIDE_RADAR = True
 RADAR_RANGE_KM = 150.0
@@ -112,30 +118,8 @@ def parse_filename(filename: str) -> datetime:
     m = FILENAME_RE.match(filename)
     if not m:
         raise ValueError(
-            f"Dateiname passt nicht zu 'raa01-rw_10000-YYMMDDHHMM-dwd---bin.hdf5': {filename}")
+            f"Dateiname passt nicht zu 'raa01-ry_10000-YYMMDDHHMM-dwd---bin.hdf5': {filename}")
     return datetime.strptime(m.group(1), "%y%m%d%H%M").replace(tzinfo=timezone.utc)
-
-
-TOLERANCE_MIN = 30   # Datei gilt für eine Stunde, wenn ihr Zeitstempel max. so weit abweicht
-
-
-def index_files(src_dir: Path) -> dict[datetime, Path]:
-    """Alle RW-Dateien im Ordner: Zeitstempel -> Pfad."""
-    out = {}
-    for p in src_dir.glob("raa01-rw_10000-*-dwd---bin.hdf5"):
-        if FILENAME_RE.match(p.name):
-            out[parse_filename(p.name)] = p
-    return out
-
-
-def find_hour_file(index: dict[datetime, Path], t: datetime) -> Path | None:
-    """Datei, deren Zeitstempel am nächsten an t liegt (innerhalb TOLERANCE_MIN)."""
-    best, best_diff = None, timedelta(minutes=TOLERANCE_MIN, seconds=1)
-    for ts, p in index.items():
-        diff = abs(ts - t)
-        if diff < best_diff:
-            best, best_diff = p, diff
-    return best
 
 
 def _attr_str(v) -> str:
@@ -162,8 +146,8 @@ def find_data_dataset(h5file: h5py.File) -> h5py.Dataset:
     return candidates[0]
 
 
-def read_sum_mm(ds: h5py.Dataset) -> np.ndarray:
-    """Dataset -> mm (NaN = kein Wert)."""
+def read_mm(ds: h5py.Dataset) -> np.ndarray:
+    """Dataset -> mm je 5 min (NaN = kein Wert). Gibt Diagnose aus."""
     what = None
     for grp in (ds.parent, ds.parent.parent, ds.file):
         w = grp.get("what")
@@ -176,9 +160,18 @@ def read_sum_mm(ds: h5py.Dataset) -> np.ndarray:
     offset = float(_scalar(attrs.get("offset", 0.0)))
     nodata = _scalar(attrs.get("nodata", DEFAULT_NODATA))
     undetect = _scalar(attrs["undetect"]) if "undetect" in attrs else None
+    quantity = _attr_str(_scalar(attrs.get("quantity", "?")))
+    units = _attr_str(_scalar(attrs.get("units", attrs.get("unit", "?"))))
+
+    if RATE_TO_MM is not None:
+        factor, why = float(RATE_TO_MM), "manuell"
+    elif quantity.upper() == "RATE" or "/h" in units.lower().replace(" ", ""):
+        factor, why = 5 / 60, "Rate in mm/h erkannt -> mm je 5 min"
+    else:
+        factor, why = 1.0, "Menge in mm je 5 min angenommen"
 
     raw = ds[()]
-    values = raw.astype(np.float64) * gain + offset
+    values = (raw.astype(np.float64) * gain + offset) * factor
 
     invalid = raw == nodata
     if np.issubdtype(raw.dtype, np.integer):
@@ -191,6 +184,7 @@ def read_sum_mm(ds: h5py.Dataset) -> np.ndarray:
         values[raw == undetect] = 0.0
         invalid &= raw != undetect
     values[invalid] = np.nan
+    
     return values
 
 
@@ -279,8 +273,6 @@ def webmercator_target_grid(lon_min, lon_max, lat_min, lat_max):
 
 
 def build_warp_map(grid, to_proj, x_new, y_new):
-    """Einmal berechnen, dann für alle 24 Stunden wiederverwenden.
-    Gibt (valid, row, col) zurück: Zielpixel -> Pixel im nativen Raster."""
     xx, yy = np.meshgrid(x_new, y_new)
     lon, lat = webmercator_to_lonlat(xx, yy)
     x_nat, y_nat = to_proj.transform(lon.ravel(), lat.ravel())
@@ -304,16 +296,16 @@ def apply_warp(data, warp_map, fill=np.nan):
 # --------------------------------------------------------------------------- #
 # Einfärben
 # --------------------------------------------------------------------------- #
-def colorize(total_mm: np.ndarray) -> np.ndarray:
+def colorize(mm: np.ndarray) -> np.ndarray:
     levels = np.array(LEVELS, dtype=np.float64)
     colors = np.array([hex_to_rgb(c) for c in COLORS], dtype=np.uint8)
 
-    rgba = np.zeros((*total_mm.shape, 4), dtype=np.uint8)
-    visible = np.isfinite(total_mm) & (total_mm >= MIN_VISIBLE_MM)
+    rgba = np.zeros((*mm.shape, 4), dtype=np.uint8)
+    visible = np.isfinite(mm) & (mm >= MIN_VISIBLE_MM)
     if not visible.any():
         return rgba
 
-    idx = np.searchsorted(levels - 1e-9, total_mm[visible], side="right") - 1
+    idx = np.searchsorted(levels - 1e-9, mm[visible], side="right") - 1
     idx = np.clip(idx, 0, len(colors) - 1)
     rgba[visible, :3] = colors[idx]
     rgba[visible, 3] = 255
@@ -321,7 +313,7 @@ def colorize(total_mm: np.ndarray) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
-# RS24-Chunk (sparse Zeitreihe)
+# Sparse-Chunk
 # --------------------------------------------------------------------------- #
 def embed_sparse_chunk(webp_path: Path, stack: np.ndarray, stamps: list[int],
                        extent: list[float], quantum: float = QUANTUM) -> None:
@@ -349,7 +341,7 @@ def embed_sparse_chunk(webp_path: Path, stack: np.ndarray, stamps: list[int],
         raise ValueError(f"{webp_path} ist keine gültige WebP-Datei")
     new_riff = struct.unpack("<I", content[4:8])[0] + len(chunk)
     Path(webp_path).write_bytes(content[:4] + struct.pack("<I", new_riff) + content[8:] + chunk)
-    print(f"RS24: {len(idx)} von {h * w} Pixeln gespeichert, Chunk {len(chunk) / 1e6:.2f} MB")
+    print(f"{RS_FOURCC.decode()}: {len(idx)} von {h * w} Pixeln gespeichert, Chunk {len(chunk) / 1e6:.2f} MB")
 
 
 def read_sparse(webp_path):
@@ -362,7 +354,7 @@ def read_sparse(webp_path):
             break
         pos += 8 + size + (size & 1)
     else:
-        raise ValueError("kein RS24-Chunk")
+        raise ValueError(f"kein {RS_FOURCC.decode()}-Chunk")
 
     _, _, w, h = struct.unpack_from("<BBII", p, 0)
     extent = struct.unpack_from("<4d", p, 10)
@@ -391,7 +383,7 @@ def query(s, lat, lon):
     else:
         v = np.zeros(len(s["stamps"]), dtype=np.int16)
     return [{"time": datetime.fromtimestamp(t_, timezone.utc).isoformat(),
-             "mm": None if x_ < 0 else round(float(x_) * s["q"], 1)}
+            "mm": None if x_ < 0 else round(float(x_) * s["q"], 3)}
             for t_, x_ in zip(s["stamps"], v)]
 
 
@@ -409,39 +401,33 @@ def main() -> None:
         return
 
     if len(sys.argv) > 1:
-        end_path = Path(sys.argv[1])
-        src_dir = end_path.parent
+        src_path = Path(sys.argv[1])
     else:
-        src_dir = SRC_DIR
-        candidates = sorted(p for p in src_dir.glob("raa01-rw_10000-*-dwd---bin.hdf5")
+        candidates = sorted(p for p in SRC_DIR.glob("raa01-ry_10000-*-dwd---bin.hdf5")
                             if FILENAME_RE.match(p.name))
         if not candidates:
-            sys.exit(f"Keine RW-Datei in {src_dir} gefunden.")
-        end_path = candidates[-1]
+            sys.exit(f"Keine RY-Datei in {SRC_DIR} gefunden.")
+        src_path = candidates[-1]
 
-    index = index_files(src_dir)
-    end_ts = parse_filename(end_path.name)
-    times = [end_ts - timedelta(hours=h) for h in range(HOURS - 1, -1, -1)]   # älteste zuerst
-    print(f"Fenster: {times[0]:%Y-%m-%d %H:%M} .. {times[-1]:%Y-%m-%d %H:%M} UTC ({HOURS} Stunden)")
+    ts = parse_filename(src_path.name)
+    print(f"Datei: {src_path.name}  ({ts:%Y-%m-%d %H:%M} UTC)")
 
-    # Rasterinfo aus der ersten vorhandenen Datei
-    grid = None
-    for t in times:
-        p = find_hour_file(index, t)
-        if p is not None:
-            with h5py.File(p, "r") as f:
-                where = find_where_group(f)
-                if where is None:
-                    sys.exit("Keine 'where'-Projektionsinfo gefunden - Warp nicht möglich.")
-                grid = extract_grid_info(where)
-            break
-    if grid is None:
-        sys.exit("Keine der 24 RW-Dateien vorhanden.")
+    with h5py.File(src_path, "r") as f:
+        where = find_where_group(f)
+        if where is None:
+            sys.exit("Keine 'where'-Projektionsinfo gefunden - Warp nicht möglich.")
+        grid = extract_grid_info(where)
+        mm = read_mm(find_data_dataset(f))
+
+    shape_native = (grid["ysize"], grid["xsize"])
+    if mm.shape != shape_native:
+        sys.exit(f"Rastergröße {mm.shape} passt nicht zu {shape_native}.")
 
     to_proj = Transformer.from_crs("EPSG:4326", grid["projdef"], always_xy=True)
     to_wgs84 = Transformer.from_crs(grid["projdef"], "EPSG:4326", always_xy=True)
 
-    covered = radar_coverage_mask(grid, to_proj) if MASK_OUTSIDE_RADAR else None
+    if MASK_OUTSIDE_RADAR:
+        mm = np.where(radar_coverage_mask(grid, to_proj), mm, np.nan)
 
     ll_x, ll_y, x_max, y_max = native_origin_and_extent(grid, to_proj)
     lon_min, lon_max, lat_min, lat_max = wgs84_bbox_from_perimeter(ll_x, ll_y, x_max, y_max, to_wgs84)
@@ -450,50 +436,15 @@ def main() -> None:
     print(f"Zielraster: {len(x_new)} x {len(y_new)} px")
 
     warp_map = build_warp_map(grid, to_proj, x_new, y_new)
+    merc = apply_warp(mm, warp_map)
 
-    shape_native = (grid["ysize"], grid["xsize"])
-    acc = np.zeros(shape_native, dtype=np.float64)       # Summe über vorhandene Stunden
-    cnt = np.zeros(shape_native, dtype=np.int16)         # Anzahl gültiger Stunden je Pixel
-    layers: list[np.ndarray] = []
-    stamps: list[int] = []
-    missing = []
+    layer = np.full(merc.shape, -1, dtype=np.int16)
+    okm = np.isfinite(merc)
+    layer[okm] = np.round(merc[okm] / QUANTUM).astype(np.int16)      # 0,01 mm
+    stack = layer[::-1][None, ...]                                   # (1, H, W), Norden oben
+    stamps = [int(ts.timestamp())]
 
-    for t in times:
-        stamps.append(int(t.timestamp()))
-        layer = np.full((len(y_new), len(x_new)), -1, dtype=np.int16)
-        p = find_hour_file(index, t)
-        if p is None:
-            missing.append(t)
-            layers.append(layer[::-1])
-            continue
-
-        with h5py.File(p, "r") as f:
-            mm = read_sum_mm(find_data_dataset(f))
-        if mm.shape != shape_native:
-            sys.exit(f"{p.name}: Rastergröße {mm.shape} passt nicht zu {shape_native}.")
-        if covered is not None:
-            mm = np.where(covered, mm, np.nan)
-
-        ok = np.isfinite(mm)
-        acc[ok] += mm[ok]
-        cnt[ok] += 1
-
-        merc = apply_warp(mm, warp_map)
-        okm = np.isfinite(merc)
-        layer[okm] = np.round(merc[okm] * 10).astype(np.int16)    # 0,1 mm
-        layers.append(layer[::-1])                                # Norden oben
-        print(f"  {t:%Y-%m-%d %H:%M} UTC  <-  {p.name}")
-
-    if missing:
-        print("WARNUNG: fehlende Stunden (Summe unvollständig): "
-              + ", ".join(f"{m:%d.%m. %H:%M}" for m in missing), file=sys.stderr)
-
-    # Bild: leer (voll transparent) oder farbige 24h-Summe
-    if DRAW_IMAGE:
-        total_native = np.where(cnt > 0, acc, np.nan)
-        rgba = colorize(apply_warp(total_native, warp_map))
-    else:
-        rgba = np.zeros((len(y_new), len(x_new), 4), dtype=np.uint8)
+    rgba = colorize(merc) if DRAW_IMAGE else np.zeros((*merc.shape, 4), dtype=np.uint8)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = OUT_DIR / OUT_FILENAME
@@ -501,11 +452,9 @@ def main() -> None:
     Image.fromarray(np.ascontiguousarray(rgba[::-1]), mode="RGBA").save(
         tmp_path, format="WEBP", lossless=True)
 
-    stack = np.stack(layers)
-    del layers
     embed_sparse_chunk(tmp_path, stack, stamps, extent)
-    tmp_path.replace(out_path)    # atomar ersetzen, kein halbfertiges File für Leser
-    print(f"Gespeichert: {out_path}  (Ende Fenster: {end_ts:%Y-%m-%d %H:%M} UTC)")
+    tmp_path.replace(out_path)
+    print(f"Gespeichert: {out_path}  ({ts:%Y-%m-%d %H:%M} UTC)")
 
 
 if __name__ == "__main__":

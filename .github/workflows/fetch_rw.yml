@@ -101,15 +101,15 @@ jobs:
           echo "Geladen: $count von $RW_HOURS Dateien."
           [ -z "$missing" ] || echo "Fehlend:$missing"
 
-      - name: Generate radarsumme_latest.webp
-        run: python scripts/generate_webp.py
+      - name: Generate radarsumme24h_latest.webp
+        run: python scripts/generate_rw.py
 
-      - name: Upload radarsumme_latest.webp to R2 (mit Retry)
+      - name: Upload radarsumme24h_latest.webp to R2 (mit Retry)
         run: |
           MAX_ATTEMPTS=3
           for i in $(seq 1 "$MAX_ATTEMPTS"); do
-            if aws s3 cp ./output/radarsumme24h/radarsumme_latest.webp \
-                s3://${{ secrets.R2_BUCKET }}/radarsumme/radarsumme_latest.webp \
+            if aws s3 cp ./output/radarsumme24h/radarsumme24h_latest.webp \
+                s3://${{ secrets.R2_BUCKET }}/radarsumme/radarsumme24h_latest.webp \
                 --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com; then
               echo "Upload erfolgreich (Versuch $i/$MAX_ATTEMPTS)."
               exit 0
